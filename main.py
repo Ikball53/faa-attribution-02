@@ -1,49 +1,44 @@
-#!/usr/bin/env python3
-"""Minute-by-minute quantile forecasts for Polymarket Yes prices.
+"""FAA outage attribution forecaster.
 
-Reads every *.in case in the input directory and writes one *.out forecast
-per case. Each market's median is its last price (persistence: every drift
-tried on the practice data made the loss worse, so the median does not
-move). Its spread grows like the horizon to the power 0.4 and scales with
-that market's own recent realised volatility, widening after jumps and
-narrowing while flat. Standard library only, no randomness, byte-identical
-on repeat runs.
+Forecasts each market's Yes price for the 240 minutes after a checkpoint as
+five quantiles per minute. Design, from the shape of Polymarket prediction
+markets: prices sit still most minutes and then jump, so the forecast fan is
+strongly asymmetric -- a long lower tail, a compressed upper inner quantile,
+and a wide upper outer tail -- with the exact shape sliding with the market's
+price level (big markets fall further and rise less than small ones). The
+median drifts with the family: the markets are mutually exclusive, so when
+their prices sum away from one the median is pulled back toward a sum of one,
+gated to cases where the sum is clearly off. Young markets (short history)
+move more, so their fan is wider. Volatility is a two-scale exponentially
+weighted RMS of capped one-minute moves.
 """
-
 import json
 import math
 import os
-from pathlib import Path
 
-Z_SCORES = (-1.6448536269514722, -0.6744897501960817, 0.0,
-            0.6744897501960817, 1.6448536269514722)
-LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+
+QUANTILE_LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 HORIZON = 240
-
-# Volatility windows and blend.
-SHORT_MINUTES = 180
-SHORT_HALF_LIFE = 90.0
-LONG_MINUTES = 1440
-LONG_HALF_LIFE = 720.0
-SHORT_WEIGHT = 0.7
-DIFF_CAP = 0.10
-SIGMA_SCALE = 0.6
-SIGMA_FLOOR = 0.0006
+GROWTH_POWER = 0.4
+SIGMA_SCALE = 0.9
+SIGMA_FLOOR = 0.0002
 SIGMA_CAP = 0.006
-SPREAD_EXPONENT = 0.4
+MOVE_CAP = 0.05
+YOUNG_MINUTES = 500
+YOUNG_WIDEN = 1.5
+SUM_GATE = 0.05
+SUM_TAU = 120.0
 
-# Jump widening: a move this large in the last half hour widens the spread.
-JUMP_MINUTES = 30
-JUMP_SIZE = 0.04
-JUMP_FACTOR = 1.5
-
-# Flat narrowing: almost no movement over the last two hours narrows it.
-FLAT_MINUTES = 120
-FLAT_TOTAL = 0.001
-FLAT_FACTOR = 0.6
+# Fan shape (quantile offsets in units of the spread) at the two ends of the
+# price-level slide: small markets and big markets. The middle three entries
+# are the median (0) and the inner quantiles; the outer entries are the tails.
+SHAPE_SMALL = (-2.0, -0.8, 0.0, 0.1, 2.9)
+SHAPE_BIG = (-2.8, -1.5, 0.0, 0.1, 1.3)
+LEVEL_LOW = 0.03
+LEVEL_HIGH = 0.25
 
 
-def clamp01(value):
+def _clamp01(value):
     if value < 0.0:
         return 0.0
     if value > 1.0:
@@ -51,115 +46,107 @@ def clamp01(value):
     return value
 
 
-def ewma_sigma(prices, window, half_life):
-    """Root mean square of capped one-minute diffs, recent minutes heavier."""
-    diffs = prices[-window - 1:]
-    if len(diffs) < 2:
-        return None
-    total = 0.0
-    weight_sum = 0.0
-    for idx in range(len(diffs) - 1, 0, -1):
-        age = len(diffs) - 1 - idx
-        weight = 0.5 ** (age / half_life)
-        step = diffs[idx] - diffs[idx - 1]
-        if step > DIFF_CAP:
-            step = DIFF_CAP
-        elif step < -DIFF_CAP:
-            step = -DIFF_CAP
-        total += weight * step * step
-        weight_sum += weight
-    if weight_sum <= 0.0:
-        return None
-    return math.sqrt(total / weight_sum)
+def _round6(value):
+    return round(_clamp01(value) * 1000000.0) / 1000000.0 + 0.0
 
 
-def recent_move_total(prices, window):
-    """Total absolute movement over the last `window` minutes."""
-    tail = prices[-window - 1:]
-    total = 0.0
-    for idx in range(1, len(tail)):
-        total += abs(tail[idx] - tail[idx - 1])
-    return total
+def _ewma_rms(moves, half_life):
+    """Root-mean-square of moves with exponential weights (newest heaviest)."""
+    alpha = 1.0 - 0.5 ** (1.0 / half_life)
+    acc = 0.0
+    for move in moves:
+        acc = (1.0 - alpha) * acc + alpha * move * move
+    return math.sqrt(acc)
 
 
-def biggest_recent_jump(prices, window):
-    """Largest single one-minute move over the last `window` minutes."""
-    tail = prices[-window - 1:]
-    biggest = 0.0
-    for idx in range(1, len(tail)):
-        move = abs(tail[idx] - tail[idx - 1])
-        if move > biggest:
-            biggest = move
-    return biggest
+def _volatility(prices):
+    """Two-scale volatility of one-minute moves, capped and floored.
+
+    The blend is scaled by 0.6, clamped to [floor, cap], then scaled by 0.9.
+    """
+    if len(prices) < 2:
+        return SIGMA_FLOOR * SIGMA_SCALE
+    steps = []
+    for i in range(len(prices) - 1):
+        step = prices[i + 1] - prices[i]
+        if step > MOVE_CAP:
+            step = MOVE_CAP
+        elif step < -MOVE_CAP:
+            step = -MOVE_CAP
+        steps.append(step)
+    near = _ewma_rms(steps[-180:], 90)
+    far = _ewma_rms(steps[-1440:], 720)
+    vol = 0.6 * (0.7 * near + 0.3 * far)
+    if vol < SIGMA_FLOOR:
+        vol = SIGMA_FLOOR
+    if vol > SIGMA_CAP:
+        vol = SIGMA_CAP
+    return vol * SIGMA_SCALE
 
 
-def market_sigma(prices):
-    """Per-market spread scale in price units per square-root minute."""
-    short = ewma_sigma(prices, SHORT_MINUTES, SHORT_HALF_LIFE)
-    long = ewma_sigma(prices, LONG_MINUTES, LONG_HALF_LIFE)
-    if short is None and long is None:
-        return 0.0025
-    if short is None:
-        sigma = long
-    elif long is None:
-        sigma = short
-    else:
-        sigma = SHORT_WEIGHT * short + (1.0 - SHORT_WEIGHT) * long
-    sigma *= SIGMA_SCALE
-    if biggest_recent_jump(prices, JUMP_MINUTES) >= JUMP_SIZE:
-        sigma *= JUMP_FACTOR
-    if recent_move_total(prices, FLAT_MINUTES) <= FLAT_TOTAL:
-        sigma *= FLAT_FACTOR
-    if sigma < SIGMA_FLOOR:
-        sigma = SIGMA_FLOOR
-    elif sigma > SIGMA_CAP:
-        sigma = SIGMA_CAP
-    return sigma
+def _fan_shape(level):
+    """Asymmetric fan offsets for a market at this checkpoint price."""
+    slide = (level - LEVEL_LOW) / (LEVEL_HIGH - LEVEL_LOW)
+    if slide < 0.0:
+        slide = 0.0
+    elif slide > 1.0:
+        slide = 1.0
+    return tuple(
+        SHAPE_SMALL[i] + (SHAPE_BIG[i] - SHAPE_SMALL[i]) * slide
+        for i in range(5)
+    )
 
 
-def forecast_market(prices):
-    """240 rows of 5 quantiles for one market, median pinned at the last
-    price, spread widening like horizon ** SPREAD_EXPONENT."""
+def _forecast_market(prices, family_sum, family_size):
+    """240 rows of five quantiles for one market."""
     last = prices[-1]
-    sigma = market_sigma(prices)
+    vol = _volatility(prices)
+    if len(prices) < YOUNG_MINUTES:
+        vol *= YOUNG_WIDEN
+    offsets = _fan_shape(last)
+    pull = 0.0
+    if abs(family_sum - 1.0) >= SUM_GATE and family_sum > 0.0:
+        pull = (1.0 - family_sum) / family_sum
     rows = []
-    for hour_step in range(1, HORIZON + 1):
-        spread = sigma * (hour_step ** SPREAD_EXPONENT)
-        row = []
-        previous = -1.0
-        for z in Z_SCORES:
-            value = clamp01(last + z * spread)
-            if value < previous:
-                value = previous
-            value = round(value, 6)
-            if value < previous:
-                value = previous
-            previous = value
-            row.append(value)
+    for minute in range(1, HORIZON + 1):
+        if pull:
+            drift = pull * (1.0 - math.exp(-minute / SUM_TAU))
+            centre = last * (1.0 + drift)
+        else:
+            centre = last
+        growth = vol * (minute ** GROWTH_POWER)
+        row = [_round6(centre + offsets[k] * growth) for k in range(5)]
+        row.sort()
         rows.append(row)
     return rows
 
 
-def run_case(case):
+def forecast_case(case):
+    markets = case["markets"]
+    total = 0.0
+    for market in markets:
+        total += market["prices"][-1]
     forecasts = []
-    for entry in case["markets"]:
-        rows = forecast_market(entry["prices"])
-        forecasts.append({"id": entry["id"], "q": rows})
+    for market in markets:
+        rows = _forecast_market(market["prices"], total, len(markets))
+        forecasts.append({"id": market["id"], "q": rows})
     return {"forecasts": forecasts}
 
 
 def main():
-    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for in_path in sorted(in_dir.glob("*.in")):
-        with open(in_path, "r", encoding="utf-8") as handle:
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input/")
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output/")
+    os.makedirs(output_dir, exist_ok=True)
+    names = sorted(
+        name for name in os.listdir(input_dir) if name.endswith(".in")
+    )
+    for name in names:
+        with open(os.path.join(input_dir, name), "r", encoding="utf-8") as handle:
             case = json.load(handle)
-        result = run_case(case)
-        out_path = out_dir / (in_path.stem + ".out")
-        text = json.dumps(result, sort_keys=True, separators=(",", ":"))
-        with open(out_path, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        result = forecast_case(case)
+        out_name = name[:-3] + ".out"
+        with open(os.path.join(output_dir, out_name), "w", encoding="utf-8") as handle:
+            json.dump(result, handle, separators=(",", ":"))
 
 
 if __name__ == "__main__":
